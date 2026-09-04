@@ -79,6 +79,11 @@ export function getSupabaseClient(): SupabaseClient | null {
   try {
     const client = createClient(url, anonKey, {
       auth: { persistSession: false },
+      realtime: {
+        params: {
+          eventsPerSecond: 10,
+        },
+      },
     });
     cachedClient = { client, key: cacheSignature };
     return client;
@@ -92,10 +97,12 @@ export interface TestResult {
   success: boolean;
   message: string;
   tableDetails?: {
-    failedPaymentsTable: string;
-    failedPaymentsCount: number;
-    actionLogsTable: string;
-    actionLogsCount: number;
+    auditLogsTable?: string;
+    auditLogsCount?: number;
+    failedPaymentsTable?: string;
+    failedPaymentsCount?: number;
+    actionLogsTable?: string;
+    actionLogsCount?: number;
   };
   details?: string;
   helpHint?: string;
@@ -120,75 +127,70 @@ export async function testConnection(
 
     const testClient = createClient(url, anonKey, { auth: { persistSession: false } });
 
-    // 1. Test failed_payments (or failed_payment singular)
-    let fpTable = 'failed_payments';
-    let fpCount = 0;
-    let fpRes = await testClient.from('failed_payments').select('*', { count: 'exact', head: true });
-
-    if (fpRes.error) {
-      // Try singular if plural failed
-      const altRes = await testClient.from('failed_payment').select('*', { count: 'exact', head: true });
-      if (!altRes.error) {
-        fpTable = 'failed_payment';
-        fpCount = altRes.count || 0;
-      } else {
-        const errorMsg = fpRes.error.message || 'Unknown database error';
-        let hint = '';
-        if (errorMsg.includes('does not exist') || errorMsg.includes('relation')) {
-          hint = "Table 'failed_payments' does not exist in this database. Run the SQL table creation script in Supabase.";
-        } else if (errorMsg.includes('policy') || errorMsg.includes('permission') || fpRes.error.code === '42501') {
-          hint = "Row Level Security (RLS) is blocking access. Run: ALTER TABLE failed_payments DISABLE ROW LEVEL SECURITY; or create a SELECT policy for anon.";
-        } else if (errorMsg.includes('JWT') || errorMsg.includes('apikey')) {
-          hint = "Invalid Anon Key or Project URL. Verify credentials from Supabase Settings -> API.";
-        }
-        return {
-          success: false,
-          message: `Error querying failed_payments: ${errorMsg}`,
-          details: fpRes.error.details || fpRes.error.hint,
-          helpHint: hint,
-        };
-      }
+    // 1. Test audit_logs (Priority table)
+    let auditTable = '';
+    let auditCount = 0;
+    const auditRes = await testClient.from('audit_logs').select('*', { count: 'exact', head: true });
+    
+    if (!auditRes.error) {
+      auditTable = 'audit_logs';
+      auditCount = auditRes.count || 0;
     } else {
-      fpCount = fpRes.count || 0;
+      // Check action_log or action_logs
+      const alRes = await testClient.from('action_log').select('*', { count: 'exact', head: true });
+      if (!alRes.error) {
+        auditTable = 'action_log';
+        auditCount = alRes.count || 0;
+      } else {
+        const alRes2 = await testClient.from('action_logs').select('*', { count: 'exact', head: true });
+        if (!alRes2.error) {
+          auditTable = 'action_logs';
+          auditCount = alRes2.count || 0;
+        }
+      }
     }
 
-    // 2. Test action_log (or action_logs plural)
-    let alTable = 'action_log';
-    let alCount = 0;
-    let alRes = await testClient.from('action_log').select('*', { count: 'exact', head: true });
-
-    if (alRes.error) {
-      const altRes = await testClient.from('action_logs').select('*', { count: 'exact', head: true });
-      if (!altRes.error) {
-        alTable = 'action_logs';
-        alCount = altRes.count || 0;
-      } else {
-        const errorMsg = alRes.error.message || 'Unknown database error';
-        let hint = '';
-        if (errorMsg.includes('does not exist') || errorMsg.includes('relation')) {
-          hint = "Table 'action_log' does not exist. Run the SQL table creation script in Supabase.";
-        } else if (errorMsg.includes('policy') || errorMsg.includes('permission') || alRes.error.code === '42501') {
-          hint = "Row Level Security (RLS) is blocking access on 'action_log'. Run: ALTER TABLE action_log DISABLE ROW LEVEL SECURITY; or create a SELECT policy.";
-        }
-        return {
-          success: false,
-          message: `Error querying action_log: ${errorMsg}`,
-          details: alRes.error.details || alRes.error.hint,
-          helpHint: hint,
-        };
-      }
+    // 2. Test failed_payments
+    let fpTable = '';
+    let fpCount = 0;
+    const fpRes = await testClient.from('failed_payments').select('*', { count: 'exact', head: true });
+    if (!fpRes.error) {
+      fpTable = 'failed_payments';
+      fpCount = fpRes.count || 0;
     } else {
-      alCount = alRes.count || 0;
+      const fpRes2 = await testClient.from('failed_payment').select('*', { count: 'exact', head: true });
+      if (!fpRes2.error) {
+        fpTable = 'failed_payment';
+        fpCount = fpRes2.count || 0;
+      }
+    }
+
+    if (!auditTable && !fpTable) {
+      const errorMsg = auditRes.error?.message || fpRes.error?.message || 'Tables not found';
+      let hint = '';
+      if (errorMsg.includes('does not exist') || errorMsg.includes('relation')) {
+        hint = "Table 'audit_logs' or 'failed_payments' does not exist in this database yet. Run the SQL table creation script in Supabase.";
+      } else if (errorMsg.includes('policy') || errorMsg.includes('permission') || auditRes.error?.code === '42501') {
+        hint = "Row Level Security (RLS) is blocking read access. Add a SELECT policy for anon on audit_logs.";
+      } else if (errorMsg.includes('JWT') || errorMsg.includes('apikey')) {
+        hint = "Invalid Anon Key or Project URL. Verify credentials from Supabase Settings -> API.";
+      }
+
+      return {
+        success: false,
+        message: `Database connection test failed: ${errorMsg}`,
+        helpHint: hint,
+      };
     }
 
     return {
       success: true,
       message: 'Successfully connected to your Supabase database!',
       tableDetails: {
-        failedPaymentsTable: fpTable,
-        failedPaymentsCount: fpCount,
-        actionLogsTable: alTable,
-        actionLogsCount: alCount,
+        auditLogsTable: auditTable || undefined,
+        auditLogsCount: auditTable ? auditCount : undefined,
+        failedPaymentsTable: fpTable || undefined,
+        failedPaymentsCount: fpTable ? fpCount : undefined,
       },
     };
   } catch (error: any) {

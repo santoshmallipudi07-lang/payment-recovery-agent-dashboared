@@ -11,6 +11,9 @@ interface HeaderProps {
   onRefresh: () => void;
   isLoading: boolean;
   onOpenConfig: () => void;
+  isRealtimeConnected?: boolean;
+  realtimeEventsCount?: number;
+  activeTable?: string;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -18,6 +21,9 @@ export const Header: React.FC<HeaderProps> = ({
   onRefresh,
   isLoading,
   onOpenConfig,
+  isRealtimeConnected = false,
+  realtimeEventsCount = 0,
+  activeTable = 'audit_logs',
 }) => {
   const [timeString, setTimeString] = useState<string>('');
   const [isScrolled, setIsScrolled] = useState<boolean>(false);
@@ -89,10 +95,26 @@ export const Header: React.FC<HeaderProps> = ({
                 }`}
                 title="Click to configure Supabase credentials"
               >
-                <Database className="w-3 h-3 text-gold-400" />
                 <span>{isUsingMockData ? 'Demo Dataset' : 'Live Supabase'}</span>
                 <SlidersHorizontal className="w-2.5 h-2.5 opacity-60 ml-0.5" />
               </button>
+
+              {/* Realtime Live Pill */}
+              {!isUsingMockData && (
+                <div className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium tracking-wide border transition-all ${
+                  isRealtimeConnected 
+                    ? 'bg-gold-950/40 border-gold-500/40 text-gold-300' 
+                    : 'bg-charcoal-800 border-white/10 text-offwhite-500'
+                }`}>
+                  <span className={`w-1.5 h-1.5 rounded-full ${isRealtimeConnected ? 'bg-gold-400 animate-ping' : 'bg-offwhite-600'}`} />
+                  <span>{isRealtimeConnected ? `LIVE: ${activeTable}` : 'CONNECTING REALTIME...'}</span>
+                  {realtimeEventsCount > 0 && (
+                    <span className="ml-1 px-1.5 py-0.2 rounded-full text-[9px] font-mono bg-gold-500/30 text-gold-200">
+                      +{realtimeEventsCount} new
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
             
             <p className="text-xs text-offwhite-500 tracking-wide mt-0.5">

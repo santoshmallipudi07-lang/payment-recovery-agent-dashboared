@@ -1,11 +1,12 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { 
   FailedPayment, 
-  ActionLog, 
   AuditTrailItem, 
   RecoveryMetrics, 
   ActionDistribution,
-  FailureReasonDistribution 
+  FailureReasonDistribution,
+  ActionTaken,
+  PaymentStatus 
 } from '../types/database';
 import { 
   getSupabaseClient, 
@@ -18,15 +19,109 @@ import {
 } from '../lib/mockData';
 import { formatFailureReason } from '../lib/formatters';
 
+// Flexible parser for audit_logs or action_log table rows
+export function normalizeAuditLogRow(row: any, paymentsMap?: Map<string, FailedPayment>): AuditTrailItem {
+  const paymentId = String(
+    row.failed_payment_id || 
+    row.payment_id || 
+    row.paymentId || 
+    row.razorpay_payment_id ||
+    row.id || 
+    'pay_unknown'
+  );
+
+  const payment = paymentsMap?.get(paymentId);
+
+  // Parse Action
+  const rawAction = String(row.action_taken || row.action || row.decision || 'retry').toLowerCase();
+  const actionTaken: ActionTaken = rawAction.includes('nudge')
+    ? 'nudge'
+    : rawAction.includes('escalat')
+    ? 'escalate'
+    : 'retry';
+
+  // Parse Amount (Paise)
+  let amountPaise = 0;
+  if (payment?.amount !== undefined) {
+    amountPaise = Number(payment.amount) || 0;
+  } else if (row.amount !== undefined) {
+    amountPaise = Number(row.amount) || 0;
+  } else if (row.amount_paise !== undefined) {
+    amountPaise = Number(row.amount_paise) || 0;
+  } else if (row.amount_inr !== undefined) {
+    amountPaise = Math.round((Number(row.amount_inr) || 0) * 100);
+  }
+
+  const amountINR = amountPaise / 100;
+
+  // Parse Method
+  const method = String(
+    payment?.method || row.method || row.payment_method || 'upi'
+  ).toLowerCase();
+
+  // Parse Failure Reason
+  const failureReason = String(
+    payment?.failure_reason || 
+    row.failure_reason || 
+    row.error_reason || 
+    row.error_code || 
+    row.reason_code ||
+    'gateway_technical_error'
+  );
+
+  // Parse Outcome
+  const outcome = String(row.outcome || row.status || 'pending').toLowerCase();
+
+  // Parse Status
+  let paymentStatus: PaymentStatus = 'open';
+  if (payment?.status) {
+    paymentStatus = payment.status;
+  } else if (outcome === 'recovered') {
+    paymentStatus = 'recovered';
+  } else if (outcome.includes('escalat')) {
+    paymentStatus = 'escalated';
+  }
+
+  return {
+    id: row.id || `audit_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    paymentId,
+    amountPaise,
+    amountINR,
+    method,
+    failureReason,
+    retryCount: Number(payment?.retry_count ?? row.retry_count ?? row.retryCount ?? 0),
+    paymentStatus,
+    actionTaken,
+    reasoning: String(
+      row.reasoning || 
+      row.reason || 
+      row.message || 
+      row.explanation || 
+      'Autonomous recovery agent evaluated transaction heuristics.'
+    ),
+    outcome,
+    timestamp: row.created_at || row.timestamp || row.inserted_at || new Date().toISOString(),
+    customerEmail: payment?.customer_email || row.customer_email || row.email,
+  };
+}
+
 export function useRecoveryData() {
   const [payments, setPayments] = useState<FailedPayment[]>([]);
-  const [actionLogs, setActionLogs] = useState<ActionLog[]>([]);
+  const [auditTrail, setAuditTrail] = useState<AuditTrailItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [isUsingMockData, setIsUsingMockData] = useState<boolean>(false);
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
-  const [isSeeding, setIsSeeding] = useState<boolean>(false);
+  const [isRealtimeConnected, setIsRealtimeConnected] = useState<boolean>(false);
+  const [realtimeEventsCount, setRealtimeEventsCount] = useState<number>(0);
+  const [activeAuditTable, setActiveAuditTable] = useState<string>('audit_logs');
+  const [recentInsertedIds, setRecentInsertedIds] = useState<Set<string | number>>(new Set());
 
+  // Ref to always access latest payments inside real-time subscription callbacks
+  const paymentsRef = useRef<FailedPayment[]>(payments);
+  paymentsRef.current = payments;
+
+  // 1. Initial Fetch from Supabase
   const fetchData = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -34,11 +129,11 @@ export function useRecoveryData() {
     const client = getSupabaseClient();
     const creds = getSupabaseCredentials();
 
-    // If no credentials configured, default to high-fidelity mock dataset
+    // If no credentials configured, show the initial demo preview
     if (!client || !creds.isConfigured) {
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      await new Promise((resolve) => setTimeout(resolve, 300));
       setPayments(MOCK_FAILED_PAYMENTS);
-      setActionLogs(MOCK_ACTION_LOG);
+      setAuditTrail(buildJoinedAuditTrail(MOCK_FAILED_PAYMENTS, MOCK_ACTION_LOG));
       setIsUsingMockData(true);
       setLoading(false);
       setLastUpdated(new Date());
@@ -46,74 +141,95 @@ export function useRecoveryData() {
     }
 
     try {
-      // 1. Fetch failed_payments (or singular failed_payment)
-      let paymentsData: any[] | null = null;
-      let fpError: any = null;
-
+      // 1. Fetch failed_payments if table exists
+      let paymentsData: FailedPayment[] = [];
       const fpRes = await client.from('failed_payments').select('*');
-      if (fpRes.error) {
-        // Try singular name
+      if (!fpRes.error && Array.isArray(fpRes.data)) {
+        paymentsData = fpRes.data as FailedPayment[];
+      } else {
         const altFp = await client.from('failed_payment').select('*');
-        if (!altFp.error) {
-          paymentsData = altFp.data;
-        } else {
-          fpError = fpRes.error;
+        if (!altFp.error && Array.isArray(altFp.data)) {
+          paymentsData = altFp.data as FailedPayment[];
         }
+      }
+
+      const paymentsMap = new Map<string, FailedPayment>();
+      paymentsData.forEach((p) => paymentsMap.set(p.id, p));
+
+      // 2. Fetch initial records from audit_logs table (Priority)
+      let rawLogs: any[] = [];
+      let detectedTable = 'audit_logs';
+
+      const auditRes = await client.from('audit_logs').select('*');
+      if (!auditRes.error && Array.isArray(auditRes.data)) {
+        rawLogs = auditRes.data;
+        detectedTable = 'audit_logs';
       } else {
-        paymentsData = fpRes.data;
-      }
-
-      if (fpError) {
-        throw new Error(`failed_payments query failed: ${fpError.message}`);
-      }
-
-      // 2. Fetch action_log (or plural action_logs)
-      let actionLogsData: any[] | null = null;
-      let alError: any = null;
-
-      const alRes = await client.from('action_log').select('*');
-      if (alRes.error) {
-        // Try plural name
-        const altAl = await client.from('action_logs').select('*');
-        if (!altAl.error) {
-          actionLogsData = altAl.data;
+        // Fallback to action_log or action_logs
+        const alRes = await client.from('action_log').select('*');
+        if (!alRes.error && Array.isArray(alRes.data)) {
+          rawLogs = alRes.data;
+          detectedTable = 'action_log';
         } else {
-          alError = alRes.error;
+          const alRes2 = await client.from('action_logs').select('*');
+          if (!alRes2.error && Array.isArray(alRes2.data)) {
+            rawLogs = alRes2.data;
+            detectedTable = 'action_logs';
+          } else {
+            // Neither table found - notify user cleanly
+            throw new Error(
+              auditRes.error?.message || 
+              alRes.error?.message || 
+              "Table 'audit_logs' was not found in Supabase."
+            );
+          }
         }
-      } else {
-        actionLogsData = alRes.data;
       }
 
-      if (alError) {
-        throw new Error(`action_log query failed: ${alError.message}`);
+      setActiveAuditTable(detectedTable);
+
+      // Normalize all initial logs
+      const normalizedItems: AuditTrailItem[] = rawLogs.map((row) =>
+        normalizeAuditLogRow(row, paymentsMap)
+      );
+
+      // Sort chronological (most recent first)
+      normalizedItems.sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+
+      // If payments table wasn't present, build synthesized payments list from audit_logs
+      if (paymentsData.length === 0 && normalizedItems.length > 0) {
+        const uniquePayments = new Map<string, FailedPayment>();
+        normalizedItems.forEach((item) => {
+          if (!uniquePayments.has(item.paymentId)) {
+            uniquePayments.set(item.paymentId, {
+              id: item.paymentId,
+              amount: item.amountPaise,
+              method: item.method,
+              failure_reason: item.failureReason,
+              retry_count: item.retryCount,
+              status: item.paymentStatus,
+              created_at: item.timestamp,
+              customer_email: item.customerEmail,
+            });
+          }
+        });
+        paymentsData = Array.from(uniquePayments.values());
       }
 
-      // Sort client-side safely without crashing if created_at does not exist
-      const sortedPayments = (paymentsData || []).slice().sort((a, b) => {
-        if (a.created_at && b.created_at) {
-          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-        }
-        return String(b.id || '').localeCompare(String(a.id || ''));
-      });
-
-      const sortedActions = (actionLogsData || []).slice().sort((a, b) => {
-        if (a.created_at && b.created_at) {
-          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-        }
-        return String(b.id || '').localeCompare(String(a.id || ''));
-      });
-
-      setPayments(sortedPayments as FailedPayment[]);
-      setActionLogs(sortedActions as ActionLog[]);
+      // STRICT: Replace static seed data! User's live database is now displayed.
+      setPayments(paymentsData);
+      setAuditTrail(normalizedItems);
       setIsUsingMockData(false);
       setLastUpdated(new Date());
     } catch (err: any) {
-      console.warn('Supabase fetch failed, falling back to demo dataset:', err);
-      setError(err?.message || 'Could not fetch data from Supabase tables.');
-      // Keep mock data as fallback so UI remains functional while showing error
-      setPayments(MOCK_FAILED_PAYMENTS);
-      setActionLogs(MOCK_ACTION_LOG);
-      setIsUsingMockData(true);
+      console.warn('Supabase fetch failed:', err);
+      setError(err?.message || 'Could not fetch records from audit_logs.');
+      // When connection fails, show empty state or helpful error, do not silently mask
+      setPayments([]);
+      setAuditTrail([]);
+      setIsUsingMockData(false);
     } finally {
       setLoading(false);
     }
@@ -123,77 +239,157 @@ export function useRecoveryData() {
     fetchData();
   }, [fetchData]);
 
-  // Optional: Seed sample test records into the user's Supabase database
-  const seedSampleDataToSupabase = async (): Promise<{ success: boolean; message: string }> => {
+  // 2. Real-time Subscription for INSERT Events using @supabase/supabase-js
+  useEffect(() => {
     const client = getSupabaseClient();
-    if (!client) {
-      return { success: false, message: 'Supabase client is not configured.' };
+    const creds = getSupabaseCredentials();
+
+    if (!client || !creds.isConfigured || isUsingMockData) {
+      setIsRealtimeConnected(false);
+      return;
     }
 
-    setIsSeeding(true);
-    try {
-      // Determine table names
-      let fpTable = 'failed_payments';
-      const testFp = await client.from('failed_payments').select('id', { head: true });
-      if (testFp.error) fpTable = 'failed_payment';
+    // Subscribe to INSERT events across audit_logs, action_log, and failed_payments
+    const channelName = `realtime_webhook_${Date.now()}`;
+    const channel = client
+      .channel(channelName)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'audit_logs',
+        },
+        (payload) => {
+          console.log('⚡ Realtime INSERT on audit_logs:', payload.new);
+          handleIncomingAuditLog(payload.new);
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'action_log',
+        },
+        (payload) => {
+          console.log('⚡ Realtime INSERT on action_log:', payload.new);
+          handleIncomingAuditLog(payload.new);
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'failed_payments',
+        },
+        (payload) => {
+          console.log('⚡ Realtime INSERT on failed_payments:', payload.new);
+          handleIncomingPayment(payload.new);
+        }
+      )
+      .subscribe((status) => {
+        console.log(`Realtime channel [${channelName}] status:`, status);
+        setIsRealtimeConnected(status === 'SUBSCRIBED');
+      });
 
-      let alTable = 'action_log';
-      const testAl = await client.from('action_log').select('id', { head: true });
-      if (testAl.error) alTable = 'action_logs';
+    return () => {
+      console.log(`Removing realtime channel [${channelName}]`);
+      client.removeChannel(channel);
+      setIsRealtimeConnected(false);
+    };
+  }, [isUsingMockData]);
 
-      // Insert payments
-      const { error: insFpErr } = await client.from(fpTable).upsert(
-        MOCK_FAILED_PAYMENTS.map(p => ({
-          id: p.id,
-          amount: p.amount,
-          method: p.method,
-          failure_reason: p.failure_reason,
-          retry_count: p.retry_count,
-          status: p.status,
-          created_at: p.created_at,
-          customer_email: p.customer_email,
-          customer_name: p.customer_name
-        }))
-      );
+  // Handle incoming real-time audit log
+  const handleIncomingAuditLog = useCallback((newRow: any) => {
+    const currentPayments = paymentsRef.current;
+    const paymentsMap = new Map<string, FailedPayment>();
+    currentPayments.forEach((p) => paymentsMap.set(p.id, p));
 
-      if (insFpErr) throw insFpErr;
+    const newItem = normalizeAuditLogRow(newRow, paymentsMap);
 
-      // Insert actions
-      const { error: insAlErr } = await client.from(alTable).upsert(
-        MOCK_ACTION_LOG.map(a => ({
-          id: a.id,
-          failed_payment_id: a.failed_payment_id,
-          action_taken: a.action_taken,
-          reasoning: a.reasoning,
-          outcome: a.outcome,
-          created_at: a.created_at
-        }))
-      );
+    // Update Audit Trail (prepend to top)
+    setAuditTrail((prev) => {
+      // Avoid duplicates
+      const filtered = prev.filter((item) => item.id !== newItem.id);
+      return [newItem, ...filtered];
+    });
 
-      if (insAlErr) throw insAlErr;
+    // Update or add payment in state to reflect new live metric
+    setPayments((prev) => {
+      const idx = prev.findIndex((p) => p.id === newItem.paymentId);
+      if (idx !== -1) {
+        const updated = [...prev];
+        updated[idx] = {
+          ...updated[idx],
+          status: newItem.paymentStatus,
+          retry_count: Math.max(updated[idx].retry_count, newItem.retryCount),
+        };
+        return updated;
+      } else {
+        return [
+          {
+            id: newItem.paymentId,
+            amount: newItem.amountPaise,
+            method: newItem.method,
+            failure_reason: newItem.failureReason,
+            retry_count: newItem.retryCount,
+            status: newItem.paymentStatus,
+            created_at: newItem.timestamp,
+            customer_email: newItem.customerEmail,
+          },
+          ...prev,
+        ];
+      }
+    });
 
-      await fetchData();
-      return { 
-        success: true, 
-        message: `Successfully populated ${MOCK_FAILED_PAYMENTS.length} sample failed payments into your Supabase database!` 
-      };
-    } catch (err: any) {
-      return { 
-        success: false, 
-        message: `Seeding failed: ${err?.message || 'Database error'}` 
-      };
-    } finally {
-      setIsSeeding(false);
-    }
-  };
+    // Highlight row briefly
+    setRecentInsertedIds((prev) => new Set(prev).add(newItem.id));
+    setTimeout(() => {
+      setRecentInsertedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(newItem.id);
+        return next;
+      });
+    }, 4500);
 
-  // Compute Joined Audit Trail
-  const auditTrail: AuditTrailItem[] = useMemo(() => {
-    return buildJoinedAuditTrail(payments, actionLogs);
-  }, [payments, actionLogs]);
+    setRealtimeEventsCount((c) => c + 1);
+    setLastUpdated(new Date());
+  }, []);
 
-  // Compute Metrics
+  // Handle incoming real-time failed_payment
+  const handleIncomingPayment = useCallback((newPayment: any) => {
+    const mappedPayment: FailedPayment = {
+      id: String(newPayment.id),
+      amount: Number(newPayment.amount) || 0,
+      method: String(newPayment.method || 'upi'),
+      failure_reason: String(newPayment.failure_reason || 'unknown_error'),
+      retry_count: Number(newPayment.retry_count) || 0,
+      status: (newPayment.status as PaymentStatus) || 'open',
+      created_at: newPayment.created_at || new Date().toISOString(),
+      customer_email: newPayment.customer_email,
+      customer_name: newPayment.customer_name,
+    };
+
+    setPayments((prev) => {
+      const filtered = prev.filter((p) => p.id !== mappedPayment.id);
+      return [mappedPayment, ...filtered];
+    });
+
+    setRealtimeEventsCount((c) => c + 1);
+    setLastUpdated(new Date());
+  }, []);
+
+  // 3. Compute Metrics
   const metrics: RecoveryMetrics = useMemo(() => {
+    // If payments array has items, compute from payments
+    // If payments array is empty but auditTrail has items, compute directly from auditTrail
+    const sourcePayments: Array<{ amountPaise: number; status: string }> = 
+      payments.length > 0
+        ? payments.map((p) => ({ amountPaise: Number(p.amount) || 0, status: p.status }))
+        : auditTrail.map((a) => ({ amountPaise: a.amountPaise, status: a.paymentStatus }));
+
     let totalAtRiskPaise = 0;
     let totalRecoveredPaise = 0;
     let escalatedCount = 0;
@@ -202,18 +398,18 @@ export function useRecoveryData() {
     let stillOpenPaise = 0;
     let recoveredCount = 0;
 
-    payments.forEach((p) => {
-      totalAtRiskPaise += Number(p.amount) || 0;
+    sourcePayments.forEach((p) => {
+      totalAtRiskPaise += p.amountPaise;
 
       if (p.status === 'recovered') {
-        totalRecoveredPaise += Number(p.amount) || 0;
+        totalRecoveredPaise += p.amountPaise;
         recoveredCount += 1;
       } else if (p.status === 'escalated') {
         escalatedCount += 1;
-        escalatedPaise += Number(p.amount) || 0;
+        escalatedPaise += p.amountPaise;
       } else {
         stillOpenCount += 1;
-        stillOpenPaise += Number(p.amount) || 0;
+        stillOpenPaise += p.amountPaise;
       }
     });
 
@@ -232,12 +428,12 @@ export function useRecoveryData() {
       stillOpenCount,
       stillOpenAmountINR: stillOpenPaise / 100,
       recoveredCount,
-      totalCount: payments.length,
+      totalCount: sourcePayments.length,
       recoveryRatePercent,
     };
-  }, [payments]);
+  }, [payments, auditTrail]);
 
-  // Compute Action Breakdown for Recharts Donut
+  // 4. Compute Action Breakdown for Recharts Donut
   const actionBreakdown: ActionDistribution[] = useMemo(() => {
     const counts = { retry: 0, nudge: 0, escalate: 0 };
     const recoveredCounts = { retry: 0, nudge: 0, escalate: 0 };
@@ -282,18 +478,29 @@ export function useRecoveryData() {
     ];
   }, [auditTrail]);
 
-  // Compute Failure Reasons
+  // 5. Compute Failure Reasons Breakdown
   const failureReasonBreakdown: FailureReasonDistribution[] = useMemo(() => {
     const map = new Map<string, { count: number; amountPaise: number; recovered: number }>();
 
-    payments.forEach((p) => {
-      const reason = p.failure_reason || 'unknown_error';
-      const cur = map.get(reason) || { count: 0, amountPaise: 0, recovered: 0 };
-      cur.count += 1;
-      cur.amountPaise += Number(p.amount) || 0;
-      if (p.status === 'recovered') cur.recovered += 1;
-      map.set(reason, cur);
-    });
+    if (auditTrail.length > 0) {
+      auditTrail.forEach((a) => {
+        const reason = a.failureReason || 'unknown_error';
+        const cur = map.get(reason) || { count: 0, amountPaise: 0, recovered: 0 };
+        cur.count += 1;
+        cur.amountPaise += a.amountPaise;
+        if (a.paymentStatus === 'recovered' || a.outcome === 'recovered') cur.recovered += 1;
+        map.set(reason, cur);
+      });
+    } else {
+      payments.forEach((p) => {
+        const reason = p.failure_reason || 'unknown_error';
+        const cur = map.get(reason) || { count: 0, amountPaise: 0, recovered: 0 };
+        cur.count += 1;
+        cur.amountPaise += Number(p.amount) || 0;
+        if (p.status === 'recovered') cur.recovered += 1;
+        map.set(reason, cur);
+      });
+    }
 
     return Array.from(map.entries())
       .map(([reason, stats]) => ({
@@ -304,12 +511,13 @@ export function useRecoveryData() {
         recoveredPercent: stats.count > 0 ? Math.round((stats.recovered / stats.count) * 100) : 0,
       }))
       .sort((a, b) => b.count - a.count);
-  }, [payments]);
+  }, [payments, auditTrail]);
 
+  // Switch between mock demo and live Supabase
   const switchDataSource = (useMock: boolean) => {
     if (useMock) {
       setPayments(MOCK_FAILED_PAYMENTS);
-      setActionLogs(MOCK_ACTION_LOG);
+      setAuditTrail(buildJoinedAuditTrail(MOCK_FAILED_PAYMENTS, MOCK_ACTION_LOG));
       setIsUsingMockData(true);
       setError(null);
     } else {
@@ -319,7 +527,6 @@ export function useRecoveryData() {
 
   return {
     payments,
-    actionLogs,
     auditTrail,
     metrics,
     actionBreakdown,
@@ -328,9 +535,11 @@ export function useRecoveryData() {
     error,
     isUsingMockData,
     lastUpdated,
-    isSeeding,
+    isRealtimeConnected,
+    realtimeEventsCount,
+    activeAuditTable,
+    recentInsertedIds,
     refresh: fetchData,
     switchDataSource,
-    seedSampleDataToSupabase,
   };
 }
