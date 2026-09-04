@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  ShieldCheck, 
-  RotateCw, 
-  Database, 
-  SlidersHorizontal 
+import {
+  ShieldCheck,
+  RotateCw,
+  SlidersHorizontal
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -56,13 +55,12 @@ export const Header: React.FC<HeaderProps> = ({
   }, []);
 
   return (
-    <header className={`sticky top-0 z-30 w-full px-4 sm:px-6 lg:px-8 py-3.5 transition-all duration-300 ${
-      isScrolled 
-        ? 'bg-charcoal-950/90 backdrop-blur-xl border-b border-gold-500/25 shadow-xl shadow-black/50 py-3' 
-        : 'fintech-glass border-b border-white/[0.07] py-3.5'
-    }`}>
+    <header className={`sticky top-0 z-30 w-full px-4 sm:px-6 lg:px-8 py-3.5 transition-all duration-300 ${isScrolled
+      ? 'bg-charcoal-950/90 backdrop-blur-xl border-b border-gold-500/25 shadow-xl shadow-black/50 py-3'
+      : 'fintech-glass border-b border-white/[0.07] py-3.5'
+      }`}>
       <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-        
+
         {/* Left: Brand & Agent Identity */}
         <div className="flex items-center space-x-3.5">
           <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-charcoal-800 border border-gold-500/30 text-gold-500 shadow-gold-glow">
@@ -78,7 +76,7 @@ export const Header: React.FC<HeaderProps> = ({
               <h1 className="text-lg font-semibold tracking-tight text-offwhite-100 flex items-center gap-2">
                 Payment Recovery Agent
               </h1>
-              
+
               {/* Agent Active Pill */}
               <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium tracking-wide bg-emerald-950/60 border border-emerald-500/30 text-emerald-400">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -86,13 +84,12 @@ export const Header: React.FC<HeaderProps> = ({
               </div>
 
               {/* Data source badge */}
-              <button 
+              <button
                 onClick={onOpenConfig}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium tracking-wide transition-all border ${
-                  isUsingMockData
-                    ? 'bg-amber-950/40 border-gold-500/30 text-gold-300 hover:border-gold-400/60'
-                    : 'bg-charcoal-800 border-white/10 text-offwhite-300 hover:border-white/20'
-                }`}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium tracking-wide transition-all border ${isUsingMockData
+                  ? 'bg-amber-950/40 border-gold-500/30 text-gold-300 hover:border-gold-400/60'
+                  : 'bg-charcoal-800 border-white/10 text-offwhite-300 hover:border-white/20'
+                  }`}
                 title="Click to configure Supabase credentials"
               >
                 <span>{isUsingMockData ? 'Demo Dataset' : 'Live Supabase'}</span>
@@ -101,11 +98,10 @@ export const Header: React.FC<HeaderProps> = ({
 
               {/* Realtime Live Pill */}
               {!isUsingMockData && (
-                <div className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium tracking-wide border transition-all ${
-                  isRealtimeConnected 
-                    ? 'bg-gold-950/40 border-gold-500/40 text-gold-300' 
-                    : 'bg-charcoal-800 border-white/10 text-offwhite-500'
-                }`}>
+                <div className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium tracking-wide border transition-all ${isRealtimeConnected
+                  ? 'bg-gold-950/40 border-gold-500/40 text-gold-300'
+                  : 'bg-charcoal-800 border-white/10 text-offwhite-500'
+                  }`}>
                   <span className={`w-1.5 h-1.5 rounded-full ${isRealtimeConnected ? 'bg-gold-400 animate-ping' : 'bg-offwhite-600'}`} />
                   <span>{isRealtimeConnected ? `LIVE: ${activeTable}` : 'CONNECTING REALTIME...'}</span>
                   {realtimeEventsCount > 0 && (
@@ -116,7 +112,7 @@ export const Header: React.FC<HeaderProps> = ({
                 </div>
               )}
             </div>
-            
+
             <p className="text-xs text-offwhite-500 tracking-wide mt-0.5">
               Autonomous Razorpay Failure Resolution • Smart Retry, Nudge & Escalation
             </p>
